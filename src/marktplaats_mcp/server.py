@@ -28,6 +28,16 @@ SEARCH_URL = "https://www.marktplaats.nl/lrp/api/search"
 SELLER_URL = "https://www.marktplaats.nl/v/api/seller-profile"
 LISTING_URL = "https://link.marktplaats.nl"
 
+# Traits that indicate a business seller
+BUSINESS_TRAITS = {
+    "ADMARKT_CONSOLE",
+    "CUSTOMER_SUPPORT_BUSINESS_LINE",
+    "SELLER_PROFILE_URL",
+    "VERIFIED_SELLER",
+    "UNIQUE_SELLING_POINTS",
+    "SHOPPING_CART",
+}
+
 # Category data (commonly used categories)
 L1_CATEGORIES = {
     "antiek en kunst": 1,
@@ -137,11 +147,86 @@ def _parse_price_type(price_type: str, price_cents: int) -> str:
     return price_map.get(price_type, f"€ {price_cents / 100:,.2f}")
 
 
-def _format_listing(listing: dict) -> dict:
+def _detect_seller_type(traits: list[str]) -> str:
+    """Detect if seller is business or private based on traits."""
+    trait_set = set(traits)
+    if trait_set & BUSINESS_TRAITS:
+        return "business"
+    return "private"
+
+
+def _extract_specs_from_description(description: str, title: str = "") -> dict[str, str]:
+    """Extract hardware specs from description text for laptops/tablets."""
+    specs = {}
+    text = f"{title} {description}".lower()
+
+    # RAM patterns
+    ram_patterns = [
+        r'(\d+)\s*gb\s*ram',
+        r'ram[:\s]*(\d+)\s*gb',
+        r'(\d+)gb\s*geheugen',
+        r'werkgeheugen[:\s]*(\d+)\s*gb',
+    ]
+    for pattern in ram_patterns:
+        match = re.search(pattern, text)
+        if match:
+            specs["ram"] = f"{match.group(1)}GB"
+            break
+
+    # Storage patterns
+    storage_patterns = [
+        r'(\d+)\s*gb\s*ssd',
+        r'(\d+)\s*tb\s*ssd',
+        r'ssd[:\s]*(\d+)\s*gb',
+        r'(\d+)\s*gb\s*opslag',
+        r'(\d+)\s*tb\s*opslag',
+        r'(\d+)\s*gb\s*hdd',
+        r'(\d+)\s*tb\s*hdd',
+    ]
+    for pattern in storage_patterns:
+        match = re.search(pattern, text)
+        if match:
+            size = match.group(1)
+            storage_type = "SSD" if "ssd" in pattern else "HDD" if "hdd" in pattern else ""
+            unit = "TB" if "tb" in pattern else "GB"
+            specs["storage"] = f"{size}{unit} {storage_type}".strip()
+            break
+
+    # CPU patterns
+    cpu_patterns = [
+        r'(i[3579][-\s]?\d{4,5}\w*)',
+        r'(intel\s+core\s+i[3579])',
+        r'(ryzen\s*[3579]\s*\d{4}\w*)',
+        r'(m[123]\s*(pro|max)?)',
+        r'(apple\s+m[123])',
+    ]
+    for pattern in cpu_patterns:
+        match = re.search(pattern, text)
+        if match:
+            specs["cpu"] = match.group(1).strip().upper()
+            break
+
+    # Screen size
+    screen_patterns = [
+        r"(\d{2})['\"]?\s*inch",
+        r"(\d{2})[,.]?\d?\s*inch",
+        r"scherm[:\s]*(\d{2})",
+    ]
+    for pattern in screen_patterns:
+        match = re.search(pattern, text)
+        if match:
+            specs["screen"] = f'{match.group(1)}"'
+            break
+
+    return specs
+
+
+def _format_listing(listing: dict, include_specs: bool = False) -> dict:
     """Format a listing from API response to a clean dict."""
     price_info = listing.get("priceInfo", {})
     location = listing.get("location", {})
     seller = listing.get("sellerInformation", {})
+    traits = listing.get("traits", [])
 
     # Get first image if available
     pictures = listing.get("pictures", [])
@@ -149,30 +234,44 @@ def _format_listing(listing: dict) -> dict:
     if first_image and not first_image.startswith("http"):
         first_image = "https:" + first_image
 
-    return {
+    # Distance handling - only show if valid (>= 0)
+    distance_meters = location.get("distanceMeters")
+    distance_km = None
+    if distance_meters is not None and distance_meters >= 0:
+        distance_km = round(distance_meters / 1000, 1)
+
+    description = listing.get("description", "")
+    title = listing.get("title", "")
+
+    result = {
         "id": listing.get("itemId"),
-        "title": listing.get("title"),
-        "description": listing.get("description", "")[:200] + "..." if len(listing.get("description", "")) > 200 else listing.get("description", ""),
+        "title": title,
+        "description": description[:200] + "..." if len(description) > 200 else description,
         "price": _parse_price_type(price_info.get("priceType", ""), price_info.get("priceCents", 0)),
         "price_cents": price_info.get("priceCents", 0),
         "condition": next((attr.get("value") for attr in listing.get("attributes", []) if attr.get("key") == "condition"), None),
         "location": {
             "city": location.get("cityName"),
-            "distance_meters": location.get("distanceMeters"),
+            "distance_km": distance_km,
         },
         "seller": {
             "id": seller.get("sellerId"),
             "name": seller.get("sellerName"),
             "is_verified": seller.get("isVerified", False),
+            "type": _detect_seller_type(traits),
         },
         "date": listing.get("date"),
         "image": first_image,
         "link": f"https://link.marktplaats.nl/{listing.get('itemId')}",
-        "attributes": [
-            {"key": attr.get("key"), "value": attr.get("value")}
-            for attr in listing.get("attributes", [])
-        ],
     }
+
+    # Extract specs for electronics
+    if include_specs:
+        specs = _extract_specs_from_description(description, title)
+        if specs:
+            result["specs"] = specs
+
+    return result
 
 
 @mcp.tool()
@@ -185,12 +284,14 @@ def search_listings(
     price_from: int | None = None,
     price_to: int | None = None,
     condition: str | None = None,
+    seller_type: str | None = None,
     sort_by: str = "optimized",
     sort_order: str = "asc",
     limit: int = 10,
     offset: int = 0,
     offered_since_days: int | None = None,
     attribute_ids: list[int] | None = None,
+    extract_specs: bool = False,
 ) -> dict[str, Any]:
     """
     Search for listings on Marktplaats.nl.
@@ -199,20 +300,22 @@ def search_listings(
         query: Search query text (required if no category specified)
         category: Main category name (e.g., "computers en software", "fietsen en brommers")
         subcategory: Subcategory name (e.g., "laptops", "elektrische fietsen")
-        zip_code: Dutch postal code for distance calculations (e.g., "1016LV")
-        distance_km: Maximum distance in kilometers (default: 1000)
+        zip_code: Dutch postal code for distance calculations (e.g., "1016LV"). Required for distance filtering!
+        distance_km: Maximum distance in kilometers (default: 1000). Only works with zip_code.
         price_from: Minimum price in euros
         price_to: Maximum price in euros
         condition: Item condition: "new", "as_good_as_new", "used", "refurbished", "not_working"
+        seller_type: Filter by seller type: "business" (zakelijk, for VAT invoices) or "private" (particulier)
         sort_by: Sort method: "date", "price", "optimized", "location"
         sort_order: Sort order: "asc" or "desc"
         limit: Number of results (1-100, default: 10)
         offset: Pagination offset
         offered_since_days: Only show items posted within the last X days
         attribute_ids: List of attribute filter IDs (use get_category_filters to find these)
+        extract_specs: Try to extract hardware specs (RAM, storage, CPU) from descriptions (for laptops/tablets)
 
     Returns:
-        Dictionary with total_count and list of listings
+        Dictionary with total_count, returned_count, and list of listings
     """
     if not query and not category and not subcategory:
         return {"error": "Please provide a search query or category"}
@@ -286,13 +389,34 @@ def search_listings(
         return {"error": "Invalid response from Marktplaats"}
 
     # Format results
-    listings = [_format_listing(listing) for listing in data.get("listings", [])]
+    listings = [_format_listing(listing, include_specs=extract_specs) for listing in data.get("listings", [])]
 
-    return {
-        "total_count": data.get("totalResultCount", 0),
+    # Filter by seller type if requested
+    if seller_type:
+        seller_type_lower = seller_type.lower()
+        if seller_type_lower in ("business", "zakelijk"):
+            listings = [l for l in listings if l["seller"]["type"] == "business"]
+        elif seller_type_lower in ("private", "particulier"):
+            listings = [l for l in listings if l["seller"]["type"] == "private"]
+
+    total_count = data.get("totalResultCount", 0)
+
+    result = {
+        "total_count": total_count,
         "returned_count": len(listings),
+        "offset": offset,
         "listings": listings,
     }
+
+    # Add note about distance if no zip_code provided
+    if not zip_code:
+        result["note"] = "Provide zip_code parameter (e.g., '1016LV') to enable distance filtering and see distances"
+
+    # Add pagination hint
+    if offset + len(listings) < total_count:
+        result["next_offset"] = offset + len(listings)
+
+    return result
 
 
 @mcp.tool()
@@ -373,6 +497,14 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             if description_lines:
                 result["description_full"] = " ".join(description_lines)
 
+                # Extract specs from full description
+                specs = _extract_specs_from_description(
+                    result["description_full"],
+                    result.get("title", "")
+                )
+                if specs:
+                    result["specs"] = specs
+
         # Extract attributes/kenmerken
         attributes = {}
         attr_patterns = [
@@ -381,6 +513,8 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             (r"Framehoogte\s*([\d\s\-totcm]+)", "framehoogte"),
             (r"Schermgrootte\s*([\d\s\-inch]+)", "schermgrootte"),
             (r"Werkgeheugen[^\d]*([\d]+\s*GB)", "werkgeheugen"),
+            (r"Processorsnelheid[^\d]*([\d,\.]+\s*GHz)", "processorsnelheid"),
+            (r"Type opslag\s*(\w+)", "type_opslag"),
         ]
 
         for pattern, key in attr_patterns:
