@@ -12,20 +12,44 @@ Een MCP (Model Context Protocol) server voor het zoeken en bekijken van adverten
 
 ## Installatie
 
-```bash
-# Clone de repository
-git clone https://github.com/PonClick/marktplaats-mcp.git
-cd marktplaats-mcp
+Je kan op 2 manieren installeren: via `uvx` of handmatig.
 
-# Installeer met pip
-pip install -e .
+### `uvx`
+
+```
+claude mcp add --transport stdio marktplaats -- uvx git+https://github.com/PonClick/marktplaats-mcp marktplaats-mcp
 ```
 
-## Gebruik
+of voeg toe in `.claude.json`:
 
-### Als MCP Server
+```
+"mcpServers": {
+  "marktplaats": {
+    "type": "stdio",
+    "command": "uvx",
+    "args": [
+      "git+https://github.com/PonClick/marktplaats-mcp",
+      "marktplaats-mcp"
+    ],
+    "env": {}
+  }
+}
+```
 
-Voeg toe aan je Claude Desktop configuratie (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+### Handmatige installatie
+
+1. Git clone en pip install.
+  ```bash
+  # Clone de repository
+  git clone https://github.com/PonClick/marktplaats-mcp.git
+  cd marktplaats-mcp
+  
+  # Installeer met pip
+  pip install -e .
+  ```
+
+2. Voeg toe aan je Claude Desktop configuratie (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -36,6 +60,8 @@ Voeg toe aan je Claude Desktop configuratie (`~/Library/Application Support/Clau
   }
 }
 ```
+
+## Gebruik
 
 ### Beschikbare Tools
 
