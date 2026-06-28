@@ -1,4 +1,11 @@
-"""Marktplaats MCP Server - Search and browse Marktplaats.nl listings."""
+"""Marktplaats MCP Server - Search and browse Marktplaats.nl listings.
+
+Fork of PonClick/marktplaats-mcp with bid price improvements:
+- price_type field exposed in all listing results
+- BID_FROM start price surfaced as separate bid_from / bid_from_cents fields
+- get_listing_details detects bid type from page text
+- highest_bid returns None with a note (requires login, not scrapeable)
+"""
 
 import json
 import re
@@ -171,7 +178,6 @@ def _detect_seller_type(traits: list[str], seller_name: str = "") -> str:
     if trait_set & BUSINESS_TRAITS:
         return "business"
 
-    # Check seller name patterns
     if seller_name:
         name_lower = seller_name.lower()
         for pattern in BUSINESS_NAME_PATTERNS:
@@ -194,7 +200,6 @@ def _format_date_short(date_str: str) -> str:
     if "eergisteren" in date_lower:
         return "2d"
 
-    # Try to parse "22 jan 26" format
     month_map = {
         "jan": 1, "feb": 2, "mrt": 3, "apr": 4, "mei": 5, "jun": 6,
         "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12
@@ -224,7 +229,6 @@ def _format_condition_short(condition: str | None) -> str:
     """Convert condition to single character: N=Nieuw, G=Gebruikt, Z=Zo goed als nieuw, D=Defect."""
     if not condition:
         return ""
-
     cond_lower = condition.lower()
     if "nieuw" in cond_lower and "zo goed" not in cond_lower:
         return "N"
@@ -244,7 +248,6 @@ def _extract_specs_from_description(description: str, title: str = "") -> dict[s
     specs = {}
     text = f"{title} {description}".lower()
 
-    # RAM patterns
     ram_patterns = [
         r'(\d+)\s*gb\s*ram',
         r'ram[:\s]*(\d+)\s*gb',
@@ -257,7 +260,6 @@ def _extract_specs_from_description(description: str, title: str = "") -> dict[s
             specs["ram"] = f"{match.group(1)}GB"
             break
 
-    # Storage patterns
     storage_patterns = [
         r'(\d+)\s*gb\s*ssd',
         r'(\d+)\s*tb\s*ssd',
@@ -276,7 +278,6 @@ def _extract_specs_from_description(description: str, title: str = "") -> dict[s
             specs["storage"] = f"{size}{unit} {storage_type}".strip()
             break
 
-    # CPU patterns
     cpu_patterns = [
         r'(i[3579][-\s]?\d{4,5}\w*)',
         r'(intel\s+core\s+i[3579])',
@@ -290,7 +291,6 @@ def _extract_specs_from_description(description: str, title: str = "") -> dict[s
             specs["cpu"] = match.group(1).strip().upper()
             break
 
-    # Screen size
     screen_patterns = [
         r"(\d{2})['\"]?\s*inch",
         r"(\d{2})[,.]?\d?\s*inch",
@@ -305,6 +305,100 @@ def _extract_specs_from_description(description: str, title: str = "") -> dict[s
     return specs
 
 
+# ---------------------------------------------------------------------------
+# PATCH: bid info helpers
+# ---------------------------------------------------------------------------
+
+def _extract_bid_info_from_text(text: str) -> dict[str, Any]:
+    """
+    Parse bid-related information from the scraped page text.
+
+    Returns a dict with:
+      price_type  : "BID" | "BID_FROM" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION" | None
+      bid_from    : human-readable string like "€ 50,00" (only for BID_FROM)
+      bid_from_cents : integer cents (only for BID_FROM)
+      highest_bid : always None - requires login, not available via scraping
+      highest_bid_note : explanation string
+    """
+    result: dict[str, Any] = {
+        "price_type": None,
+        "bid_from": None,
+        "bid_from_cents": None,
+        "highest_bid": None,
+        "highest_bid_note": None,
+    }
+
+    text_lower = text.lower()
+
+    # "Bieden vanaf € X" must be checked before plain "Bieden"
+    bid_from_match = re.search(
+        r"bieden\s+vanaf\s*[€]?\s*([\d]+[.,]?[\d]*)", text_lower
+    )
+    if bid_from_match:
+        result["price_type"] = "BID_FROM"
+        raw = bid_from_match.group(1).replace(".", "").replace(",", "")
+        try:
+            cents = int(raw) * 100
+            euros = cents / 100
+            result["bid_from_cents"] = cents
+            result["bid_from"] = f"€ {euros:,.2f}"
+        except ValueError:
+            pass
+        result["highest_bid"] = None
+        result["highest_bid_note"] = (
+            "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
+        )
+        return result
+
+    # Plain "Bieden" (no start price)
+    # Look for the word "bieden" as a standalone price label, not inside normal sentence text
+    # The page uses it as a label: "Bieden\nOphalen" or "Bieden Ophalen"
+    if re.search(r'\bbieden\b', text_lower):
+        result["price_type"] = "BID"
+        result["highest_bid"] = None
+        result["highest_bid_note"] = (
+            "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
+        )
+        return result
+
+    # Other non-bid price types
+    if "gratis" in text_lower:
+        result["price_type"] = "FREE"
+    elif "n.o.t.k" in text_lower or "nader overeen te komen" in text_lower:
+        result["price_type"] = "NOTK"
+    elif "ruilen" in text_lower:
+        result["price_type"] = "EXCHANGE"
+    elif "zie omschrijving" in text_lower:
+        result["price_type"] = "SEE_DESCRIPTION"
+    else:
+        result["price_type"] = "FIXED"
+
+    return result
+
+
+def _build_bid_fields_from_api(price_type: str, price_cents: int) -> dict[str, Any]:
+    """
+    Build bid-related fields from the search API priceInfo block.
+
+    Returns dict with price_type, bid_from, bid_from_cents.
+    For BID_FROM the start price comes from price_cents.
+    """
+    fields: dict[str, Any] = {"price_type": price_type}
+
+    if price_type == "BID_FROM" and price_cents > 0:
+        fields["bid_from_cents"] = price_cents
+        fields["bid_from"] = f"€ {price_cents / 100:,.2f}"
+    else:
+        fields["bid_from_cents"] = None
+        fields["bid_from"] = None
+
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Listing formatters
+# ---------------------------------------------------------------------------
+
 def _format_listing(listing: dict, include_specs: bool = False) -> dict:
     """Format a listing from API response to a clean dict."""
     price_info = listing.get("priceInfo", {})
@@ -313,13 +407,11 @@ def _format_listing(listing: dict, include_specs: bool = False) -> dict:
     traits = listing.get("traits", [])
     seller_name = seller.get("sellerName", "")
 
-    # Get first image if available
     pictures = listing.get("pictures", [])
     first_image = pictures[0].get("mediumUrl", "") if pictures else ""
     if first_image and not first_image.startswith("http"):
         first_image = "https:" + first_image
 
-    # Distance handling - only show if valid (>= 0)
     distance_meters = location.get("distanceMeters")
     distance_km = None
     if distance_meters is not None and distance_meters >= 0:
@@ -327,15 +419,21 @@ def _format_listing(listing: dict, include_specs: bool = False) -> dict:
 
     description = listing.get("description", "")
     title = listing.get("title", "")
-
     original_link = f"https://link.marktplaats.nl/{listing.get('itemId')}"
+
+    price_type = price_info.get("priceType", "")
+    price_cents = price_info.get("priceCents", 0)
+    bid_fields = _build_bid_fields_from_api(price_type, price_cents)
 
     result = {
         "id": listing.get("itemId"),
         "title": title,
         "description": description[:200] + "..." if len(description) > 200 else description,
-        "price": _parse_price_type(price_info.get("priceType", ""), price_info.get("priceCents", 0)),
-        "price_cents": price_info.get("priceCents", 0),
+        "price": _parse_price_type(price_type, price_cents),
+        "price_cents": price_cents,
+        # PATCH: expose price_type and bid start price
+        "price_type": price_type,
+        **bid_fields,
         "condition": next((attr.get("value") for attr in listing.get("attributes", []) if attr.get("key") == "condition"), None),
         "location": {
             "city": location.get("cityName"),
@@ -352,7 +450,6 @@ def _format_listing(listing: dict, include_specs: bool = False) -> dict:
         "link": original_link,
     }
 
-    # Extract specs for electronics
     if include_specs:
         specs = _extract_specs_from_description(description, title)
         if specs:
@@ -369,7 +466,6 @@ def _format_listing_compact(listing: dict) -> dict:
     traits = listing.get("traits", [])
     seller_name = seller.get("sellerName", "")
 
-    # Distance handling
     distance_meters = location.get("distanceMeters")
     distance_km = None
     if distance_meters is not None and distance_meters >= 0:
@@ -378,15 +474,14 @@ def _format_listing_compact(listing: dict) -> dict:
     description = listing.get("description", "")
     title = listing.get("title", "")
 
-    # Get condition
     condition = next(
         (attr.get("value") for attr in listing.get("attributes", []) if attr.get("key") == "condition"),
         None
     )
 
-    # Price: return euros as int when possible, otherwise short string
     price_type = price_info.get("priceType", "")
     price_cents = price_info.get("priceCents", 0)
+
     if price_type in ("FIXED", "RESERVED") and price_cents > 0:
         price = price_cents // 100
     elif price_type == "FREE" or price_cents == 0:
@@ -394,7 +489,8 @@ def _format_listing_compact(listing: dict) -> dict:
     elif price_type == "BID":
         price = "bid"
     elif price_type == "BID_FROM":
-        price = f">{price_cents // 100}"
+        # PATCH: show start price clearly as ">X" to distinguish from FIXED
+        price = f">{price_cents // 100}" if price_cents > 0 else "bid_from"
     elif price_type == "SEE_DESCRIPTION":
         price = "?"
     elif price_type == "TO_BE_AGREED_UPON":
@@ -402,23 +498,26 @@ def _format_listing_compact(listing: dict) -> dict:
     elif price_type == "EXCHANGE":
         price = "ruil"
     elif price_cents > 0:
-        # Fallback: just show the price in euros
         price = price_cents // 100
     else:
         price = "?"
 
-    # Extract specs from title and description
     specs = _extract_specs_from_description(description, title)
 
     result = {
         "id": listing.get("itemId"),
         "title": title.strip(),
         "price": price,
+        # PATCH: expose price_type in compact mode too
+        "price_type": price_type if price_type else None,
         "city": location.get("cityName"),
         "seller": "B" if _detect_seller_type(traits, seller_name) == "business" else "P",
     }
 
-    # Only include optional fields if they have values
+    # PATCH: include bid_from for BID_FROM listings
+    if price_type == "BID_FROM" and price_cents > 0:
+        result["bid_from"] = f"€ {price_cents / 100:,.2f}"
+
     if distance_km is not None:
         result["km"] = distance_km
 
@@ -468,25 +567,26 @@ def search_listings(
         price_from: Minimum price in euros
         price_to: Maximum price in euros
         condition: Item condition: "new", "as_good_as_new", "used", "refurbished", "not_working"
-        seller_type: Filter by seller type: "business" (zakelijk, for VAT invoices) or "private" (particulier)
+        seller_type: Filter by seller type: "business" (zakelijk) or "private" (particulier)
         sort_by: Sort method: "date", "price", "optimized", "location"
         sort_order: Sort order: "asc" or "desc"
         limit: Number of results (1-100, default: 10)
         offset: Pagination offset
         offered_since_days: Only show items posted within the last X days
         attribute_ids: List of attribute filter IDs (use get_category_filters to find these)
-        extract_specs: Try to extract hardware specs (RAM, storage, CPU) from descriptions (for laptops/tablets)
+        extract_specs: Try to extract hardware specs (RAM, storage, CPU) from descriptions
         compact: Return minimal response format (~75% smaller). Omits description, image, links.
-                 Use get_listing_details(id) for full info. Seller: B=business, P=private.
-                 Condition: N=new, Z=as good as new, G=used, R=refurbished, D=defect.
+            price_type values: FIXED, BID, BID_FROM, FREE, RESERVED, SEE_DESCRIPTION,
+            TO_BE_AGREED_UPON, EXCHANGE. BID_FROM listings include a bid_from field.
 
     Returns:
-        Dictionary with total_count, returned_count, and list of listings
+        Dictionary with total_count, returned_count, and list of listings.
+        Each listing includes price_type and, for BID_FROM, bid_from / bid_from_cents.
+        Note: highest_bid is not available from search results (requires get_listing_details).
     """
     if not query and not category and not subcategory:
         return {"error": "Please provide a search query or category"}
 
-    # Build params
     params: dict[str, Any] = {
         "limit": str(min(max(1, limit), 100)),
         "offset": str(offset),
@@ -499,7 +599,6 @@ def search_listings(
         "sortOrder": SortOrder[sort_order.upper()].value if sort_order.upper() in SortOrder.__members__ else SortOrder.ASC.value,
     }
 
-    # Category handling
     if subcategory:
         subcat_lower = subcategory.lower()
         if subcat_lower in L2_CATEGORIES:
@@ -514,13 +613,11 @@ def search_listings(
         else:
             return {"error": f"Unknown category: {category}. Use list_categories to see available categories."}
 
-    # Price filter
     if price_from is not None or price_to is not None:
         price_from_cents = str(price_from * 100) if price_from is not None else "null"
         price_to_cents = str(price_to * 100) if price_to is not None else "null"
         params["attributeRanges[]"] = [f"PriceCents:{price_from_cents}:{price_to_cents}"]
 
-    # Condition filter
     condition_map = {
         "new": Condition.NEW.value,
         "as_good_as_new": Condition.AS_GOOD_AS_NEW.value,
@@ -532,19 +629,15 @@ def search_listings(
     attribute_list = []
     if condition and condition.lower() in condition_map:
         attribute_list.append(condition_map[condition.lower()])
-
     if attribute_ids:
         attribute_list.extend(attribute_ids)
-
     if attribute_list:
         params["attributesById[]"] = attribute_list
 
-    # Date filter
     if offered_since_days:
         since = datetime.now() - timedelta(days=offered_since_days)
         params["attributesByKey[]"] = [f"offeredSince:{int(since.timestamp()) * 1000}"]
 
-    # Make request
     try:
         response = _get_request(SEARCH_URL, params)
         response.raise_for_status()
@@ -554,17 +647,14 @@ def search_listings(
     except json.JSONDecodeError:
         return {"error": "Invalid response from Marktplaats"}
 
-    # Format results based on compact mode
     if compact:
         listings = [_format_listing_compact(listing) for listing in data.get("listings", [])]
     else:
         listings = [_format_listing(listing, include_specs=extract_specs) for listing in data.get("listings", [])]
 
-    # Filter by seller type if requested
     if seller_type:
         seller_type_lower = seller_type.lower()
         if compact:
-            # In compact mode, seller is "B" or "P"
             if seller_type_lower in ("business", "zakelijk"):
                 listings = [l for l in listings if l["seller"] == "B"]
             elif seller_type_lower in ("private", "particulier"):
@@ -577,7 +667,6 @@ def search_listings(
 
     total_count = data.get("totalResultCount", 0)
 
-    # Compact response format
     if compact:
         result = {
             "total": total_count,
@@ -587,7 +676,6 @@ def search_listings(
             result["next"] = offset + len(listings)
         return result
 
-    # Full response format
     result = {
         "total_count": total_count,
         "returned_count": len(listings),
@@ -595,11 +683,9 @@ def search_listings(
         "listings": listings,
     }
 
-    # Add note about distance if no zip_code provided
     if not zip_code:
         result["note"] = "Provide zip_code parameter (e.g., '1016LV') to enable distance filtering and see distances"
 
-    # Add pagination hint
     if offset + len(listings) < total_count:
         result["next_offset"] = offset + len(listings)
 
@@ -615,17 +701,24 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
         listing_id: The listing ID (e.g., "m2340580395")
 
     Returns:
-        Full listing details including description, images, attributes, and seller info
+        Full listing details including description, images, attributes, and seller info.
+
+        Bid-related fields (always present):
+          price_type     : "BID" | "BID_FROM" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION"
+          bid_from       : start price string for BID_FROM listings, e.g. "€ 50,00" (else None)
+          bid_from_cents : start price in euro cents for BID_FROM listings (else None)
+          highest_bid    : always None - Marktplaats only shows the current highest bid to
+                           logged-in users via a separate authenticated API; it cannot be
+                           retrieved via public scraping.
+          highest_bid_note : explanation of why highest_bid is None
     """
     if not listing_id:
         return {"error": "Please provide a listing_id"}
 
-    # Ensure ID has the 'm' prefix
     if not listing_id.startswith("m"):
         listing_id = f"m{listing_id}"
 
     try:
-        # Fetch the listing page
         response = _get_request(f"{LISTING_URL}/{listing_id}", headers=HTML_HEADERS)
         response.raise_for_status()
 
@@ -634,7 +727,7 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        result = {
+        result: dict[str, Any] = {
             "id": listing_id,
             "url": response.url,
         }
@@ -646,13 +739,11 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
                 if isinstance(data, dict) and data.get("@type") == "Product":
                     result["title"] = data.get("name")
                     result["description_short"] = data.get("description")
-
                     offers = data.get("offers", {})
                     result["price"] = f"€ {offers.get('price', 0)}"
                     result["price_cents"] = int(float(offers.get("price", 0)) * 100)
                     result["availability"] = "In Stock" if "InStock" in offers.get("availability", "") else "Unknown"
 
-                    # Images
                     images = data.get("image", [])
                     result["images"] = [
                         ("https:" + img if not img.startswith("http") else img)
@@ -668,7 +759,6 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             parts = text.split("|||")
             in_description = False
             description_lines = []
-
             for part in parts:
                 part = part.strip()
                 if not part:
@@ -680,17 +770,31 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
                     if part in ["Kenmerken", "Locatie", "Bied nu", "Bericht", "Vragen aan verkoper"]:
                         break
                     description_lines.append(part)
-
             if description_lines:
                 result["description_full"] = " ".join(description_lines)
 
-                # Extract specs from full description
                 specs = _extract_specs_from_description(
                     result["description_full"],
                     result.get("title", "")
                 )
                 if specs:
                     result["specs"] = specs
+
+        # PATCH: detect bid type from full page text
+        full_text = soup.get_text(separator=" ")
+        bid_info = _extract_bid_info_from_text(full_text)
+        result["price_type"] = bid_info["price_type"]
+        result["bid_from"] = bid_info["bid_from"]
+        result["bid_from_cents"] = bid_info["bid_from_cents"]
+        result["highest_bid"] = bid_info["highest_bid"]
+        result["highest_bid_note"] = bid_info["highest_bid_note"]
+
+        # For BID/BID_FROM: the JSON-LD "price" is not meaningful, so clear it
+        if bid_info["price_type"] in ("BID", "BID_FROM"):
+            result["price"] = _parse_price_type(
+                bid_info["price_type"],
+                bid_info["bid_from_cents"] or 0
+            )
 
         # Extract attributes/kenmerken
         attributes = {}
@@ -703,12 +807,10 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             (r"Processorsnelheid[^\d]*([\d,\.]+\s*GHz)", "processorsnelheid"),
             (r"Type opslag\s*(\w+)", "type_opslag"),
         ]
-
         for pattern, key in attr_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 attributes[key] = match.group(1).strip()
-
         if attributes:
             result["attributes"] = attributes
 
@@ -724,7 +826,6 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             stats["saved"] = int(saved_match.group(1))
         if date_match:
             stats["online_since"] = date_match.group(1)
-
         if stats:
             result["statistics"] = stats
 
@@ -770,7 +871,6 @@ def get_seller_info(seller_id: int) -> dict[str, Any]:
                 "phone_number": data.get("phoneNumberVerified", False),
             },
         }
-
     except requests.RequestException as e:
         return {"error": f"Request failed: {str(e)}"}
     except json.JSONDecodeError:
@@ -854,7 +954,6 @@ def get_category_filters(
     for facet in data.get("facets", []):
         key = facet.get("key")
         label = facet.get("label", key)
-
         if key in skip_keys:
             continue
 
@@ -862,13 +961,12 @@ def get_category_filters(
             options = []
             for attr in facet["attributeGroup"]:
                 attr_id = attr.get("attributeValueId")
-                if attr_id is not None:  # Skip options without ID (like date filters)
+                if attr_id is not None:
                     options.append({
                         "name": attr.get("attributeValueLabel", attr.get("attributeValueKey")),
                         "id": attr_id,
                         "count": attr.get("histogramCount", 0),
                     })
-
             if options:
                 filters[label] = options
 
