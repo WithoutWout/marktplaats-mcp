@@ -2,7 +2,7 @@
 
 Fork of PonClick/marktplaats-mcp with bid price improvements:
 - price_type field exposed in all listing results
-- BID_FROM start price surfaced as separate bid_from / bid_from_cents fields
+- MIN_BID start price surfaced as separate bid_from / bid_from_cents fields
 - get_listing_details detects bid type from page text
 - highest_bid returns None with a note (requires login, not scrapeable)
 """
@@ -160,8 +160,8 @@ def _parse_price_type(price_type: str, price_cents: int) -> str:
     """Convert price type and cents to readable string."""
     price_map = {
         "FIXED": f"€ {price_cents / 100:,.2f}",
-        "BID": "Bieden",
-        "BID_FROM": f"Bieden vanaf € {price_cents / 100:,.2f}",
+        "FAST_BID": "Bieden",
+        "MIN_BID": f"Bieden vanaf € {price_cents / 100:,.2f}",
         "FREE": "Gratis",
         "RESERVED": "Gereserveerd",
         "SEE_DESCRIPTION": "Zie omschrijving",
@@ -314,9 +314,9 @@ def _extract_bid_info_from_text(text: str) -> dict[str, Any]:
     Parse bid-related information from the scraped page text.
 
     Returns a dict with:
-      price_type  : "BID" | "BID_FROM" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION" | None
-      bid_from    : human-readable string like "€ 50,00" (only for BID_FROM)
-      bid_from_cents : integer cents (only for BID_FROM)
+      price_type  : "FAST_BID" | "MIN_BID" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION" | None
+      bid_from    : human-readable string like "€ 50,00" (only for MIN_BID)
+      bid_from_cents : integer cents (only for MIN_BID)
       highest_bid : always None - requires login, not available via scraping
       highest_bid_note : explanation string
     """
@@ -335,7 +335,7 @@ def _extract_bid_info_from_text(text: str) -> dict[str, Any]:
         r"bieden\s+vanaf\s*[€]?\s*([\d]+[.,]?[\d]*)", text_lower
     )
     if bid_from_match:
-        result["price_type"] = "BID_FROM"
+        result["price_type"] = "MIN_BID"
         raw = bid_from_match.group(1).replace(".", "").replace(",", "")
         try:
             cents = int(raw) * 100
@@ -354,7 +354,7 @@ def _extract_bid_info_from_text(text: str) -> dict[str, Any]:
     # Look for the word "bieden" as a standalone price label, not inside normal sentence text
     # The page uses it as a label: "Bieden\nOphalen" or "Bieden Ophalen"
     if re.search(r'\bbieden\b', text_lower):
-        result["price_type"] = "BID"
+        result["price_type"] = "FAST_BID"
         result["highest_bid"] = None
         result["highest_bid_note"] = (
             "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
@@ -381,11 +381,11 @@ def _build_bid_fields_from_api(price_type: str, price_cents: int) -> dict[str, A
     Build bid-related fields from the search API priceInfo block.
 
     Returns dict with price_type, bid_from, bid_from_cents.
-    For BID_FROM the start price comes from price_cents.
+    For MIN_BID the start price comes from price_cents.
     """
     fields: dict[str, Any] = {"price_type": price_type}
 
-    if price_type == "BID_FROM" and price_cents > 0:
+    if price_type == "MIN_BID" and price_cents > 0:
         fields["bid_from_cents"] = price_cents
         fields["bid_from"] = f"€ {price_cents / 100:,.2f}"
     else:
@@ -486,11 +486,10 @@ def _format_listing_compact(listing: dict) -> dict:
         price = price_cents // 100
     elif price_type == "FREE" or price_cents == 0:
         price = 0
-    elif price_type == "BID":
+    elif price_type == "FAST_BID":
         price = "bid"
-    elif price_type == "BID_FROM":
-        # PATCH: show start price clearly as ">X" to distinguish from FIXED
-        price = f">{price_cents // 100}" if price_cents > 0 else "bid_from"
+    elif price_type == "MIN_BID":
+        price = f">{price_cents // 100}" if price_cents > 0 else "min_bid"
     elif price_type == "SEE_DESCRIPTION":
         price = "?"
     elif price_type == "TO_BE_AGREED_UPON":
@@ -514,8 +513,8 @@ def _format_listing_compact(listing: dict) -> dict:
         "seller": "B" if _detect_seller_type(traits, seller_name) == "business" else "P",
     }
 
-    # PATCH: include bid_from for BID_FROM listings
-    if price_type == "BID_FROM" and price_cents > 0:
+    # PATCH: include bid_from for MIN_BID listings
+    if price_type == "MIN_BID" and price_cents > 0:
         result["bid_from"] = f"€ {price_cents / 100:,.2f}"
 
     if distance_km is not None:
@@ -576,12 +575,12 @@ def search_listings(
         attribute_ids: List of attribute filter IDs (use get_category_filters to find these)
         extract_specs: Try to extract hardware specs (RAM, storage, CPU) from descriptions
         compact: Return minimal response format (~75% smaller). Omits description, image, links.
-            price_type values: FIXED, BID, BID_FROM, FREE, RESERVED, SEE_DESCRIPTION,
-            TO_BE_AGREED_UPON, EXCHANGE. BID_FROM listings include a bid_from field.
+            price_type values: FIXED, FAST_BID, MIN_BID, FREE, RESERVED, SEE_DESCRIPTION,
+            TO_BE_AGREED_UPON, EXCHANGE. MIN_BID listings include a bid_from field.
 
     Returns:
         Dictionary with total_count, returned_count, and list of listings.
-        Each listing includes price_type and, for BID_FROM, bid_from / bid_from_cents.
+        Each listing includes price_type and, for MIN_BID, bid_from / bid_from_cents.
         Note: highest_bid is not available from search results (requires get_listing_details).
     """
     if not query and not category and not subcategory:
@@ -704,9 +703,9 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
         Full listing details including description, images, attributes, and seller info.
 
         Bid-related fields (always present):
-          price_type     : "BID" | "BID_FROM" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION"
-          bid_from       : start price string for BID_FROM listings, e.g. "€ 50,00" (else None)
-          bid_from_cents : start price in euro cents for BID_FROM listings (else None)
+          price_type     : "FAST_BID" | "MIN_BID" | "FIXED" | "FREE" | "NOTK" | "EXCHANGE" | "SEE_DESCRIPTION"
+          bid_from       : start price string for MIN_BID listings, e.g. "€ 50,00" (else None)
+          bid_from_cents : start price in euro cents for MIN_BID listings (else None)
           highest_bid    : always None - Marktplaats only shows the current highest bid to
                            logged-in users via a separate authenticated API; it cannot be
                            retrieved via public scraping.
@@ -789,8 +788,8 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
         result["highest_bid"] = bid_info["highest_bid"]
         result["highest_bid_note"] = bid_info["highest_bid_note"]
 
-        # For BID/BID_FROM: the JSON-LD "price" is not meaningful, so clear it
-        if bid_info["price_type"] in ("BID", "BID_FROM"):
+        # For FAST_BID/MIN_BID: the JSON-LD "price" is not meaningful, so clear it
+        if bid_info["price_type"] in ("FAST_BID", "MIN_BID"):
             result["price"] = _parse_price_type(
                 bid_info["price_type"],
                 bid_info["bid_from_cents"] or 0
