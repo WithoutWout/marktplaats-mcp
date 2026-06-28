@@ -329,36 +329,35 @@ def _extract_bid_info_from_text(text: str) -> dict[str, Any]:
     }
 
     text_lower = text.lower()
+    _BID_NOTE = "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
 
-    # "Bieden vanaf € X" must be checked before plain "Bieden"
-    bid_from_match = re.search(
-        r"bieden\s+vanaf\s*[€]?\s*([\d]+[.,]?[\d]*)", text_lower
+    # MIN_BID: page renders "€ 1.800,00 ophalen" (the start price) and separately shows
+    # "€ Bieden" as a button label. Detect by finding a euro amount directly before "ophalen".
+    min_bid_match = re.search(
+        r"€[\s\xa0]*([\d]+(?:[.,]\d+)*)\s*ophalen", text_lower
     )
-    if bid_from_match:
+    if min_bid_match and re.search(r"\bbieden\b", text_lower):
         result["price_type"] = "MIN_BID"
-        raw = bid_from_match.group(1).replace(".", "").replace(",", "")
+        raw = min_bid_match.group(1)
+        # Dutch format: thousands sep = ".", decimal sep = ","
+        parts = raw.replace(".", "").split(",")
         try:
-            cents = int(raw) * 100
-            euros = cents / 100
-            result["bid_from_cents"] = cents
-            result["bid_from"] = f"€ {euros:,.2f}"
-        except ValueError:
+            euros = int(parts[0])
+            cents_part = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+            total_cents = euros * 100 + cents_part
+            result["bid_from_cents"] = total_cents
+            result["bid_from"] = f"€ {total_cents / 100:,.2f}"
+        except (ValueError, IndexError):
             pass
         result["highest_bid"] = None
-        result["highest_bid_note"] = (
-            "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
-        )
+        result["highest_bid_note"] = _BID_NOTE
         return result
 
-    # Plain "Bieden" (no start price)
-    # Look for the word "bieden" as a standalone price label, not inside normal sentence text
-    # The page uses it as a label: "Bieden\nOphalen" or "Bieden Ophalen"
-    if re.search(r'\bbieden\b', text_lower):
+    # FAST_BID: "bieden" is itself the price label, directly followed by "ophalen"
+    if re.search(r"\bbieden\b", text_lower):
         result["price_type"] = "FAST_BID"
         result["highest_bid"] = None
-        result["highest_bid_note"] = (
-            "Het hoogste bod is alleen zichtbaar na inloggen en kan niet via scraping worden opgehaald."
-        )
+        result["highest_bid_note"] = _BID_NOTE
         return result
 
     # Other non-bid price types
